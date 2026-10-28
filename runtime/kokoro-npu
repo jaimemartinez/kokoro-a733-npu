@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""kokoro-npu: text to speech with Kokoro on the board's NPU.
+
+  kokoro-npu "Hola, ¿cómo estás?"                    -> salida.wav
+  kokoro-npu "Hello there" -v af_heart -l en-us -o hello.wav
+  echo "Un texto largo..." | kokoro-npu - -o texto.wav
+  kokoro-npu --voices                                 (lists the voices)
+
+Long texts are spoken a sentence at a time and joined with short pauses."""
+import argparse
+import os
+import re
+import sys
+import time
+
+HOME = os.environ.get("KOKORO_NPU_HOME", "/opt/kokoro-npu")
+sys.path.insert(0, os.path.join(HOME, "runtime"))
+
+
+def sentences(text):
+    """(sentence, pause after) pairs: whole sentences, so each keeps its own intonation."""
+    out = []
+    for s in re.split(r"(?<=[.!?;:])\s+|\n+", text):
+        s = s.strip()
+        if s:
+            out.append((s, 0.35))
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(prog="kokoro-npu", description="Text to speech with Kokoro on the A733 NPU.")
+    p.add_argument("text", nargs="?", help='the text to speak, or "-" to read it from standard input')
+    p.add_argument("-v", "--voice", default="ef_dora", help="voice (default ef_dora, Spanish; see --voices)")
+    p.add_argument("-l", "--lang", default="es", help="language of the text for the phonemizer (default es; en-us, fr-fr, it, pt-br, ...)")
+    p.add_argument("-s", "--speed", type=float, default=1.0, help="speed, 0.5 to 2.0 (default 1.0)")
+    p.add_argument("-o", "--output", default="salida.wav", help="WAV file to write (default salida.wav)")
+    p.add_argument("--voices", action="store_true", help="list the voices and exit")
+    a = p.parse_args()
+
+    import numpy as np
+    import soundfile as sf
+    from kokoro_npu import NpuKokoro
+
+    model = os.path.join(HOME, "model")
+    npu = NpuKokoro(model, os.path.join(HOME, "bin", "npu_run"), os.path.join(model, "voices-v1.0.bin"))
+    if a.voices:
+        print("\n".join(sorted(npu.get_voices())))
+        return
+    text = sys.stdin.read() if a.text in (None, "-") else a.text
+    parts = sentences(text)
+    if not parts:
+        sys.exit("kokoro-npu: no text to speak")
+    if a.voice not in npu.get_voices():
+        sys.exit(f"kokoro-npu: unknown voice {a.voice!r} (see kokoro-npu --voices)")
+    t = time.time()
+    audio = npu.speak([s for s, _ in parts], [a.voice], a.speed, a.lang)[a.voice]
+    chunks = []
+    for (s, pause), x in zip(parts, audio):
+        chunks += [x, np.zeros(int(24000 * pause), np.float32)]
+    out = np.concatenate(chunks[:-1])
+    sf.write(a.output, out, 24000)
+    print(f"{a.output}: {len(out) / 24000:.1f} s of audio in {time.time() - t:.1f} s")
+
+
+if __name__ == "__main__":
+    main()
