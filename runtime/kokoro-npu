@@ -6,7 +6,7 @@
   echo "Un texto largo..." | kokoro-npu - -o texto.wav
   kokoro-npu --voices                                 (lists the voices)
 
-Long texts are spoken a sentence at a time and joined with short pauses."""
+Long texts are spoken a few sentences at a time (as many as fit one NPU pass) and joined with short pauses."""
 import argparse
 import os
 import re
@@ -56,6 +56,8 @@ def main():
     audio = npu.speak([s for s, _ in parts], [a.voice], a.speed, a.lang)[a.voice]
     chunks = []
     for (s, pause), x in zip(parts, audio):
+        if len(x) == 0:
+            continue  # spoken together with the sentence before it (one NPU pass)
         chunks += [x, np.zeros(int(24000 * pause), np.float32)]
     out = np.concatenate(chunks[:-1])
     sf.write(a.output, out, 24000)

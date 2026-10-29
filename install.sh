@@ -9,7 +9,7 @@
 # Options: --package <file.tar.gz> uses a model package already downloaded (offline install).
 set -euo pipefail
 
-VERSION=v1.0.0
+VERSION=v1.1.0
 REPO=jaimemartinez/kokoro-a733-npu
 PREFIX=/opt/kokoro-npu
 MODEL_URL=https://github.com/$REPO/releases/download/$VERSION/kokoro-a733-npu-model-$VERSION.tar.gz
@@ -20,6 +20,17 @@ PACKAGE=""
 [ "${1:-}" = "--package" ] && PACKAGE=$(readlink -f "$2")
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
+# A big download that survives a dropped connection: it resumes where it stopped, up to 8 times.
+fetch() {
+  local url=$1 out=$2 i
+  for i in 1 2 3 4 5 6 7 8; do
+    curl -fL --progress-bar --connect-timeout 30 -C - -o "$out" "$url" && return 0
+    echo "The download stopped; resuming ($i/8)..."
+    sleep 3
+  done
+  echo "Could not download $url. Check the board's internet connection and run the installer again." >&2
+  return 1
+}
 fail() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$1" >&2; exit 1; }
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO=sudo
 
@@ -48,7 +59,7 @@ $PREFIX/uv/uv pip install -q --python $PREFIX/venv/bin/python kokoro-onnx==0.6.1
 echo "OK."
 
 step "4/7 The NPU runtime from Radxa's model zoo (downloads 200 MB once, keeps a few small files)"
-curl -fL --progress-bar -o "$TMP/zoo.tar.gz" $ZOO_URL
+fetch "$ZOO_URL" "$TMP/zoo.tar.gz"
 tar -xzf "$TMP/zoo.tar.gz" -C "$TMP" --wildcards '*/common/npuruntime/lib_linux_aarch64/A733/*' '*/common/npuruntime/include/*'
 cp "$TMP"/*/common/npuruntime/lib_linux_aarch64/A733/*.so $PREFIX/lib/
 cp "$TMP"/*/common/npuruntime/include/*.h $PREFIX/include/
@@ -56,20 +67,24 @@ rm -rf "$TMP"/*
 echo "OK."
 
 step "5/7 Building the NPU runner"
-if [ -f runtime/npu_run.c ] && [ -f runtime/kokoro_npu.py ]; then SRC=runtime; else
+if [ -f runtime/npu_run.c ] && [ -f runtime/npu_chain.c ] && [ -f runtime/kokoro_npu.py ]; then SRC=runtime; else
   SRC="$TMP/src"; mkdir -p "$SRC"
-  for f in npu_run.c kokoro_npu.py kokoro-npu; do curl -fsSL -o "$SRC/$f" "$RAW/runtime/$f"; done
+  for f in npu_run.c npu_chain.c kokoro_npu.py kokoro-npu; do curl -fsSL -o "$SRC/$f" "$RAW/runtime/$f"; done
 fi
-gcc -O2 -o $PREFIX/bin/npu_run "$SRC/npu_run.c" -I$PREFIX/include -L$PREFIX/lib -lNBGlinker -lVIPhal -lm \
-  -Wl,--disable-new-dtags,-rpath,$PREFIX/lib
+# npu_run runs one network; npu_chain runs all five per sentence in one process, the tensors between them kept on
+# the NPU (kokoro_npu.py uses it when it is there).
+for prog in npu_run npu_chain; do
+  gcc -O2 -o $PREFIX/bin/$prog "$SRC/$prog.c" -I$PREFIX/include -L$PREFIX/lib -lNBGlinker -lVIPhal -lm \
+    -Wl,--disable-new-dtags,-rpath,$PREFIX/lib
+done
 cp "$SRC/kokoro_npu.py" $PREFIX/runtime/
 sed "1s|.*|#!$PREFIX/venv/bin/python|" "$SRC/kokoro-npu" > $PREFIX/bin/kokoro-npu && chmod +x $PREFIX/bin/kokoro-npu
 echo "OK."
 
 step "6/7 The voice model for the NPU (about 110 MB) and the voices (28 MB)"
-if [ -n "$PACKAGE" ]; then cp "$PACKAGE" "$TMP/model.tar.gz"; else curl -fL --progress-bar -o "$TMP/model.tar.gz" $MODEL_URL; fi
+if [ -n "$PACKAGE" ]; then cp "$PACKAGE" "$TMP/model.tar.gz"; else fetch "$MODEL_URL" "$TMP/model.tar.gz"; fi
 tar -xzf "$TMP/model.tar.gz" -C $PREFIX/model
-[ -f $PREFIX/model/voices-v1.0.bin ] || curl -fL --progress-bar -o $PREFIX/model/voices-v1.0.bin $VOICES_URL
+[ -f $PREFIX/model/voices-v1.0.bin ] || fetch "$VOICES_URL" $PREFIX/model/voices-v1.0.bin
 echo "OK."
 
 step "7/7 Last settings and a test"

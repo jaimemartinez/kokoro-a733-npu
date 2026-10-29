@@ -29,11 +29,11 @@ python C/parts.py                   # -> parts/dec, parts/gen
 python C/gensplit.py                # -> parts/g1 .. parts/g4 (with test inputs and exact outputs)
 
 # 3. The graph rewrites the chip needs (each one checks itself against ONNX Runtime)
-python C/stage.py parts/dec  ready/dec epsfix
-python C/stage.py parts/g1   ready/g1  to4d sinfix poolfix epsfix
-python C/stage.py parts/g2   ready/g2  to4d sinfix poolfix epsfix
-python C/stage.py parts/g3   ready/g3  to4d len64 sinfix poolfix epsfix
-python C/stage.py parts/g4   ready/g4  to4d len64 sinfix poolfix epsfix
+python C/stage.py parts/dec  ready/dec epsfix decpool decnorm
+python C/stage.py parts/g1   ready/g1  to4d sinfix poolfix epsfix snakeclamp
+python C/stage.py parts/g2   ready/g2  to4d sinfix poolfix epsfix snakeclamp
+python C/stage.py parts/g3   ready/g3  to4d len64 sinfix poolfix epsfix snakeclamp resmask
+python C/stage.py parts/g4   ready/g4  to4d len64 sinfix poolfix epsfix snakeclamp resmask
 
 # 4. Compile each stage (inside the ACUITY environment)
 for s in dec g1 g2 g3 g4; do C/build_stage.sh ready/$s; done
@@ -54,8 +54,12 @@ the stage's `wksp/p_nbg_unify/network_binary.nb` and the inputs to the board and
 /opt/kokoro-npu/bin/npu_run network_binary.nb in00.f32 in01.f32 ... -- out.f32
 ```
 
-then compare `out.f32` with `ref_0.npy` (over the real samples only). The stages we shipped reach 42-58 dB; the
-audio of the whole pipeline matches the CPU model by ear.
+then compare `out.f32` with `ref_0.npy` (over the real samples only). The stages shipped in v1.1.0 reach, on
+sentences not used for calibration: dec 55 dB, g1 56, g2 48, g3 64, g4 42. Check a few sentences of different
+lengths: a stage that gives the same poor SNR on every sentence has a broken operation (see the pitfalls, 7-9).
+
+The calibration set should look like what the board will speak: sentences of every length (short ones too), and
+several voices. `prep.py` uses the sentences `split.py` ran; add yours there if your texts differ a lot.
 
 ## If you convert another model
 

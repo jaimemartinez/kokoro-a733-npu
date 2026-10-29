@@ -68,7 +68,7 @@ Instance norm computes `1/sqrt(var + 1e-5)`. For var in [1e-4, 1e-3]:
 **Fix:** [`epsfix.py`](../convert/rewrites/epsfix.py), with `eps·N` passed as an input (N is the sentence's real
 length, like `1/N`).
 
-## 5. 8-bit quantization ruins a vocoder
+## 5. 8-bit quantization ruins a vocoder (before sections 7-9's fixes)
 
 | Stage | int16 | int8 (dynamic fixed point) | uint8 (asymmetric affine) |
 |---|---|---|---|
@@ -85,10 +85,56 @@ the page cache), it falls back to small pages and the same network runs about 2x
 Setting `vm.compaction_proactiveness = 90` (default 20) keeps large free blocks and restores the full speed. Releasing
 the CPU models before the NPU stages and deleting intermediate files as soon as they are used also helps.
 
-## 7. Smaller things
+## 7. A tensor whose channels have very different sizes
+
+Per-tensor int16 means one scale for all of a tensor's channels. Kokoro's decoder normalizes (instance norm) a
+tensor that holds text features (std ~0.02) next to F0 and energy (std ~7): the small channels' squared deviations
+round to zero, their variance is lost and the norm multiplies their rounding noise by up to 50. On real sentences
+the decoder's first block came out at **2-32 dB** depending on the sentence (better calibration changed nothing).
+
+**Fix:** scale each channel by 1/std (a constant measured on the calibration set) just before the norm, and the
+norm's epsilon by s² per channel. A norm does not care about a channel's scale, so the float result is identical
+([`decnorm.py`](../convert/rewrites/decnorm.py)). The first norm went from 10 dB (worst sentence -4 dB) to 48 dB,
+the whole decoder from 25 dB to 55 dB.
+
+## 8. A per-channel constant with one outlier
+
+The same happens to constants. Snake is `x + sin²(a·x)/a` with `a` learned per channel; a few channels have
+`a ≈ 0` (one has 1e-4), so the `1/a` constant goes from 0.8 to -10552. Its single int16 scale then rounds every other
+channel's `1/a` to steps of 0.5: that multiply came out at **17.7 dB** while everything before it was at 53 dB.
+
+**Fix:** bound `|1/a|` to 32 ([`snakeclamp.py`](../convert/rewrites/snakeclamp.py)). For those channels
+`sin²(a·x)/a ≈ a·x²` is almost nothing; the stage's float output changes by 80-96 dB below the signal. Look at the
+range of every constant the compiler quantizes (the `.quantize` file lists min/max per tensor): a max far above the
+typical values is a warning.
+
+## 9. Convolution + Add on a long sequence: wrong after ~8022 samples
+
+On `[1, 128, 1, 24064]`, a residual `Add` that takes a `Conv`'s output was correct up to column 8021 and wrong from
+there on (**17.5 dB**), while the `Conv` alone was at 68 dB and the `Add` alone is fine. The compiler fuses them and
+splits the length in three tiles; the fused kernel is wrong past the first one. Shorter sequences (4000, under the
+8191 limit) are not affected. Swapping the Add's inputs does not help.
+
+**Fix:** a multiply by the mask between the Conv and the Add ([`resmask.py`](../convert/rewrites/resmask.py)): it
+keeps them apart, costs one cheap pass, and is exact over the real samples. The residual block went to 73 dB, the
+whole g3 stage from 25 dB to 64 dB, g4 from 27 dB to 42 dB.
+
+**How these three were found:** every stage was measured on the chip against ONNX Runtime with held-out sentences,
+then cut into sub-graphs (the stage up to one tensor, compiled alone) and measured again, halving the distance until
+one operation was left. Calibration settings (KL divergence, `--MLE`, 3x more and shorter sentences) changed none of
+these numbers: when every sentence gives the same SNR, look for a broken operation, not for the quantization.
+
+## 10. Smaller things
 
 - Conversion of 3-D Resize, Pad (reflect), ConvTranspose, LeakyRelu, Gemm all work.
 - The export (`pegasus export ... --pack-nbg-unify`) runs the network once in a software simulator; its time grows
   with the network size (one hour for the full decoder, 1-3 minutes per stage after the rewrites).
 - Small per-channel tensors (`[1, C, 1, 1]`) are given float16 inputs and outputs by the compiler.
 - `vpmdHARDWARE_TIMEOUT` is 20 s and compiled into the kernel module.
+- `Round` and `Sin` on a reduced argument are accurate (68 dB on a toy network).
+- Several networks can share one memory pool (`VIP_NETWORK_PROP_SET_MEMORY_POOL`) and an output buffer can be
+  handed to the next network as its input when both have the same format and fixed-point position: no copy, no CPU.
+  [`runtime/npu_chain.c`](../runtime/npu_chain.c) does this for the five stages; per sentence it saves the loading,
+  the files and the int16/float conversions between stages (3.9 s -> 0.8 s for two sentences).
+- An export that rewrites many elementwise operations can make the NBG generator (`gen_nbg`) take 5 GB of memory and
+  be killed ("Fatal model generation error: 35072"). Give the export machine plenty of RAM or fewer parallel exports.

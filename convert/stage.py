@@ -4,7 +4,9 @@ the new model's inputs: rank-3 tensors get their unit axis, sequences are zero-p
 epsn_* inputs added by epsfix.py are computed from the matching inv_* (eps / inv).
 
   python stage.py <src dir> <dst dir> <rewrite> [<rewrite> ...]
-  rewrites: to4d len64 sinfix poolfix epsfix        e.g. g3: to4d len64 sinfix poolfix epsfix; dec: epsfix"""
+  rewrites: to4d len64 sinfix poolfix epsfix decpool decnorm snakeclamp resmask
+  e.g. dec: epsfix decpool decnorm; g1/g2: to4d sinfix poolfix epsfix snakeclamp;
+       g3/g4: to4d len64 sinfix poolfix epsfix snakeclamp resmask"""
 import os
 import shutil
 import subprocess
@@ -21,7 +23,9 @@ os.makedirs(os.path.join(dst, "calib"), exist_ok=True)
 model = os.path.join(src, "middle.onnx")
 for i, step in enumerate(steps):
     out = os.path.join(dst, f".step{i}.onnx")
-    subprocess.run([sys.executable, os.path.join(HERE, "rewrites", f"{step}.py"), model, out], check=True)
+    # KOKORO_STAGE_SRC: where a rewrite that measures the data (decnorm.py) finds the calibration set
+    subprocess.run([sys.executable, os.path.join(HERE, "rewrites", f"{step}.py"), model, out], check=True,
+                   env={**os.environ, "KOKORO_STAGE_SRC": os.path.abspath(src)})
     model = out
 os.replace(model, os.path.join(dst, "middle.onnx"))
 for f in os.listdir(dst):

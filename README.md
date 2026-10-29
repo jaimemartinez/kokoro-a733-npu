@@ -10,13 +10,16 @@ kokoro-npu "Hola, ¿cómo estás? Esto lo dice la placa, sin internet." -o hola.
 It uses [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), a small open voice model with 54 voices in English,
 Spanish, French, Italian, Portuguese, Hindi, Japanese and Chinese.
 
-| Same greeting, 3 voices, Radxa Cubie A7Z (1 GB) | Total time | CPU time used | Memory peak |
-|---|---|---|---|
-| Kokoro on the CPU (int8) | 66 s | 122 s | ~280 MB |
-| **Kokoro on the NPU (this project)** | 86 s | **25–31 s** | **~140 MB** |
+| Same greeting, 3 voices, Radxa Cubie A7Z (1 GB) | Total time | CPU time used | Memory peak | Distance to the original model |
+|---|---|---|---|---|
+| Kokoro on the CPU (int8) | 80 s | ~120 s | ~280 MB | 2.8–3.3 dB |
+| Kokoro on the NPU, v1.0.0 | 86 s | 25–31 s | ~140 MB | 3.5–4.2 dB |
+| **Kokoro on the NPU, v1.1.0** | **57–63 s** | **18–32 s** | ~220 MB | **0.6–0.7 dB** |
 
-The voice sounds the same. The point is that the CPU stays free for everything else the board is doing (calls,
-web servers, a home assistant...), and memory use is about half.
+*Distance to the original model*: how far the audio is from the full-precision (float) Kokoro, as the average
+difference of the mel spectrum after aligning the two in time (lower is better; under ~1 dB is very hard to hear).
+Since v1.1.0 the NPU is both **faster than the CPU** and **closer to the original voice than the CPU's int8 model**,
+and the CPU stays free for everything else the board is doing (calls, web servers, a home assistant...).
 
 ---
 
@@ -93,15 +96,18 @@ Any voice can read any language (it will have that voice's accent).
 import sys
 sys.path.insert(0, "/opt/kokoro-npu/runtime")
 from kokoro_npu import NpuKokoro
+import numpy as np
 import soundfile as sf
 
 tts = NpuKokoro("/opt/kokoro-npu/model", "/opt/kokoro-npu/bin/npu_run", "/opt/kokoro-npu/model/voices-v1.0.bin")
-audio = tts.speak(["Hola.", "¿Qué tal tu día?"], ["ef_dora"], speed=1.0, lang="es")["ef_dora"]
-sf.write("hola.wav", audio[0], 24000)
+pieces = tts.speak(["Hola.", "¿Qué tal tu día?"], ["ef_dora"], speed=1.0, lang="es")["ef_dora"]
+sf.write("hola.wav", np.concatenate(pieces), 24000)
 ```
 
-Run it with `/opt/kokoro-npu/venv/bin/python`. Asking for several sentences and voices in one `speak` call is much
-faster than many calls: each NPU network is loaded once for the whole batch.
+Run it with `/opt/kokoro-npu/venv/bin/python`. `speak` returns one array per sentence you gave it; a sentence spoken
+in the same NPU pass as the one before it comes back empty (its audio is in that one), so join them in order.
+Asking for several sentences and voices in one `speak` call is much faster than many calls: the NPU networks are
+loaded once for the whole batch.
 
 ## If something goes wrong
 
@@ -126,8 +132,12 @@ NPU as five compiled networks (int16):
 text -> phonemes -> [front, CPU int8] -> [head, CPU] -> [dec -> g1 -> g2 -> g3 -> g4, NPU] -> [tail, CPU] -> audio
 ```
 
-Each NPU network handles about 5 seconds of speech; shorter sentences are padded and masked (same result), longer
-ones are split at a word boundary.
+Each NPU pass handles about 5 seconds of speech: consecutive sentences share one pass while they fit, and a shorter
+piece is padded and masked (same result). A longer sentence keeps its own intonation and timing: the CPU side runs on
+the whole sentence, and only the NPU part runs in overlapping windows that are crossfaded back together, so there is
+no pause or new intonation in the middle of it. The five networks run one after
+the other in a single process (`npu_chain`), loaded once, with the tensors between them left on the NPU. The CPU
+side runs on the A733's two fast cores (Cortex-A76).
 
 ## What we learned about the A733 NPU
 
@@ -142,6 +152,12 @@ differently on the chip than in the simulator.** If you convert your own models,
 - A small constant added to small values loses ~5 %: add it while the numbers are still large.
 - int8 / uint8 ruins the audio of a vocoder; int16 works.
 - The NPU runs about 2× slower when free memory is fragmented: `vm.compaction_proactiveness = 90`.
+- One int16 scale per tensor: channels of very different sizes (or a constant with one outlier) lose the small ones.
+  Rescale per channel where the math allows it (before a norm), bound the outliers.
+- A convolution followed by an add on a sequence longer than 8191 is wrong after ~8022 samples: keep them apart.
+
+v1.1.0 fixed the last three in the model; the audio went from "sounds like the CPU" to measurably closer to the
+original than the CPU's int8 model.
 
 ## Rebuilding the model yourself (advanced)
 
