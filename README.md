@@ -10,14 +10,17 @@ kokoro-npu "Hola, ¿cómo estás? Esto lo dice la placa, sin internet." -o hola.
 It uses [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), a small open voice model with 54 voices in English,
 Spanish, French, Italian, Portuguese, Hindi, Japanese and Chinese.
 
-| Same greeting, 3 voices, Radxa Cubie A7Z (1 GB) | Total time | CPU time used | Memory peak | Distance to the original model |
-|---|---|---|---|---|
-| Kokoro on the CPU (int8) | 80 s | ~120 s | ~280 MB | 2.8–3.3 dB |
-| Kokoro on the NPU, v1.0.0 | 86 s | 25–31 s | ~140 MB | 3.5–4.2 dB |
-| **Kokoro on the NPU, v1.1.0** | **57–63 s** | **18–32 s** | ~220 MB | **0.6–0.7 dB** |
+| Same greeting, 3 voices, Radxa Cubie A7Z (1 GB) | Total time | Board memory used (peak) | Distance to the original model |
+|---|---|---|---|
+| Kokoro on the CPU (int8) | 80–160 s | 393 MB | 2.8–3.3 dB |
+| Kokoro on the NPU, v1.0.0 | 85 s | 271 MB | 3.5–4.2 dB |
+| **Kokoro on the NPU, v1.1.1** | **57–81 s** | **287 MB** | **0.6–0.7 dB** |
 
-*Distance to the original model*: how far the audio is from the full-precision (float) Kokoro, as the average
-difference of the mel spectrum after aligning the two in time (lower is better; under ~1 dB is very hard to hear).
+*Board memory used*: how far the board's available memory fell during the run (the whole job: text, CPU parts,
+NPU), measured the same way for the three. Times vary with what else the board is doing; each row's range is from
+several runs. *Distance to the original model*: how far the audio is from the full-precision (float) Kokoro, as the
+average difference of the mel spectrum after aligning the two in time (lower is better; under ~1 dB is very hard to
+hear).
 Since v1.1.0 the NPU is both **faster than the CPU** and **closer to the original voice than the CPU's int8 model**,
 and the CPU stays free for everything else the board is doing (calls, web servers, a home assistant...).
 
@@ -135,9 +138,9 @@ text -> phonemes -> [front, CPU int8] -> [head, CPU] -> [dec -> g1 -> g2 -> g3 -
 Each NPU pass handles about 5 seconds of speech: consecutive sentences share one pass while they fit, and a shorter
 piece is padded and masked (same result). A longer sentence keeps its own intonation and timing: the CPU side runs on
 the whole sentence, and only the NPU part runs in overlapping windows that are crossfaded back together, so there is
-no pause or new intonation in the middle of it. The five networks run one after
-the other in a single process (`npu_chain`), loaded once, with the tensors between them left on the NPU. The CPU
-side runs on the A733's two fast cores (Cortex-A76).
+no pause or new intonation in the middle of it. The five networks run in one process (`npu_chain`), network by
+network: each one is loaded once per batch of four pieces, so only one is in memory at a time, and what the next one
+reads waits in RAM as int16 (no files, no conversions). The CPU side runs on the A733's two fast cores (Cortex-A76).
 
 ## What we learned about the A733 NPU
 

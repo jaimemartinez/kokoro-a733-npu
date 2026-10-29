@@ -134,7 +134,10 @@ these numbers: when every sentence gives the same SNR, look for a broken operati
 - `Round` and `Sin` on a reduced argument are accurate (68 dB on a toy network).
 - Several networks can share one memory pool (`VIP_NETWORK_PROP_SET_MEMORY_POOL`) and an output buffer can be
   handed to the next network as its input when both have the same format and fixed-point position: no copy, no CPU.
-  [`runtime/npu_chain.c`](../runtime/npu_chain.c) does this for the five stages; per sentence it saves the loading,
-  the files and the int16/float conversions between stages (3.9 s -> 0.8 s for two sentences).
+  Keeping all five loaded that way (`NPU_CHAIN_RESIDENT=1` in [`runtime/npu_chain.c`](../runtime/npu_chain.c))
+  costs about 100 MB more than one network at a time. The default goes network by network instead, a batch of
+  pieces through each, the tensors between them kept in RAM as the network wrote them (int16): the same speed, the
+  memory of one network plus a few MB per piece. Either way it saves the files and the int16/float conversions
+  between stages of running each network in its own process (3.9 s -> 0.8 s for two sentences).
 - An export that rewrites many elementwise operations can make the NBG generator (`gen_nbg`) take 5 GB of memory and
   be killed ("Fatal model generation error: 35072"). Give the export machine plenty of RAM or fewer parallel exports.

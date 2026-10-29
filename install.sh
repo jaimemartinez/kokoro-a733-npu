@@ -9,10 +9,11 @@
 # Options: --package <file.tar.gz> uses a model package already downloaded (offline install).
 set -euo pipefail
 
-VERSION=v1.1.0
+VERSION=v1.1.1
+MODEL_VERSION=v1.1.0 # the compiled model package (a release asset); the code above comes from $VERSION
 REPO=jaimemartinez/kokoro-a733-npu
 PREFIX=/opt/kokoro-npu
-MODEL_URL=https://github.com/$REPO/releases/download/$VERSION/kokoro-a733-npu-model-$VERSION.tar.gz
+MODEL_URL=https://github.com/$REPO/releases/download/$MODEL_VERSION/kokoro-a733-npu-model-$MODEL_VERSION.tar.gz
 VOICES_URL=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 ZOO_URL=https://dl.radxa.com/cubie/allwinner-model-zoo.tar.gz
 RAW=https://raw.githubusercontent.com/$REPO/$VERSION

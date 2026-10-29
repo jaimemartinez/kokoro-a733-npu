@@ -24,6 +24,7 @@ ASR, F0, N = "/encoder/MatMul_1_output_0", "/encoder/Reshape_output_0", "/encode
 POST = "/decoder/decoder/generator/conv_post/Conv_output_0"
 WIN_OVERLAP = 8  # frames two windows of one long piece share (0.2 s), crossfaded
 HOP = 600  # audio samples per frame (24 kHz)
+CHAIN_BATCH = int(os.environ.get("KOKORO_NPU_BATCH", "4"))  # units per npu_chain run: bounds the RAM between networks
 NORM_EPS = 1e-5  # Kokoro's instance normalizations' epsilon
 
 
@@ -200,7 +201,7 @@ class NpuKokoro:
         self._release_front()
         progress(1, steps)
         chain = os.path.join(os.path.dirname(self.runner), "npu_chain")
-        if all(s["engine"] == "npu" for s in self.stages) and os.path.exists(chain):
+        if all(s["engine"] == "npu" for s in self.stages) and os.path.exists(chain) and not os.environ.get("KOKORO_NPU_NO_CHAIN"):
             self._chain(chain, units, work, path, at, lambda done: progress(1 + (steps - 2) * done / len(units), steps))
             progress(steps - 1, steps)
             return self._tail(pieces, voices, units, path, progress, steps)
@@ -233,32 +234,38 @@ class NpuKokoro:
         return self._tail(pieces, voices, units, path, progress, steps)
 
     def _chain(self, chain, units, work, path, at, done=lambda d: None):
-        """Every NPU stage of every unit in one npu_chain run: the networks loaded once, the tensors between them left
-        on the NPU (no files, no conversions); only the last one's output comes back."""
+        """Every NPU stage of every unit through npu_chain: each network loaded once per batch, the tensors between them
+        never written to files nor turned into floats; only the last one's output comes back. npu_chain keeps one
+        network in memory at a time and a batch's tensors between networks in RAM: batches of CHAIN_BATCH units keep
+        that bounded (a few MB per unit) whatever the length of the text."""
         made = {}
         for k, s in enumerate(self.stages):
             for j, (n, _) in enumerate(s["outputs"]):
                 made.setdefault(n, (k, j))
-        jobs = os.path.join(work, "chain.jobs")
-        with open(jobs, "w") as f:
-            for u in range(len(units)):
-                groups = []
-                for k, s in enumerate(self.stages):
-                    ins = ["@%d.%d" % made[n] if n in made and made[n][0] < k else at(u, n, sh) for n, sh in s["inputs"]]
-                    outs = [path(u, n) if n == "post" else "-" for n, _ in s["outputs"]]
-                    groups.append(" ".join(ins + ["--"] + outs))
-                f.write(" | ".join(groups) + "\n")
-        # npu_chain prints one "run ..." line per finished job: the progress follows it.
-        p = subprocess.Popen([chain] + [os.path.join(self.pkg, s["file"]) for s in self.stages] + ["@" + jobs],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        lines, finished = [], 0
-        for line in p.stderr:
-            lines.append(line.rstrip())
-            if line.startswith("run "):
-                finished += 1
-                done(finished)
-        if p.wait(timeout=900) != 0:
-            raise RuntimeError(f"npu chain: {lines[-1:]}")
+        per = 1 if os.environ.get("NPU_CHAIN_RESIDENT") else len(self.stages)  # progress lines per unit
+        finished = 0
+        for b0 in range(0, len(units), CHAIN_BATCH):
+            batch = range(b0, min(b0 + CHAIN_BATCH, len(units)))
+            jobs = os.path.join(work, f"chain{b0}.jobs")
+            with open(jobs, "w") as f:
+                for u in batch:
+                    groups = []
+                    for k, s in enumerate(self.stages):
+                        ins = ["@%d.%d" % made[n] if n in made and made[n][0] < k else at(u, n, sh) for n, sh in s["inputs"]]
+                        outs = [path(u, n) if n == "post" else "-" for n, _ in s["outputs"]]
+                        groups.append(" ".join(ins + ["--"] + outs))
+                    f.write(" | ".join(groups) + "\n")
+            # npu_chain prints a line per finished run ("step" per unit and network, "run" per unit when resident).
+            p = subprocess.Popen([chain] + [os.path.join(self.pkg, s["file"]) for s in self.stages] + ["@" + jobs],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            lines = []
+            for line in p.stderr:
+                lines.append(line.rstrip())
+                if line.startswith(("run ", "step ")):
+                    finished += 1
+                    done(finished / per)
+            if p.wait(timeout=900) != 0:
+                raise RuntimeError(f"npu chain: {lines[-1:]}")
 
     def _tail(self, pieces, voices, units, path, progress, steps):
         tail = self._session("tail.onnx")
