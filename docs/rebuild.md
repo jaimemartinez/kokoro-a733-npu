@@ -14,14 +14,16 @@ You only need this to change the model or reproduce the conversion; `install.sh`
 
 ## Steps
 
-Run them from one work directory; paths below are relative to it. `C` = the `convert/` folder of this repository.
+The package holds the NPU networks at three lengths (200, 128 and 80 frames; 80 frames are 2 s of speech): steps 1-4
+run once per length, each in its own work directory (`k200`, `k128`, `k80`), with that length in place of `200`.
+Paths below are relative to the work directory. `C` = the `convert/` folder of this repository.
 
 ```bash
 # 1. Run Kokoro on sample sentences and cut it: front / head / tail for the CPU, the middle for the NPU (200 frames)
 python C/split.py kokoro-v1.0.onnx voices-v1.0.bin cut 200
 python C/static.py cut 200
 python C/mask.py cut 200            # averages over the real frames only (inputs mask_* and inv_*)
-python C/quantize_front.py cut      # optional: the front in int8 for the board's CPU
+python C/quantize_front.py cut      # optional, once (in k200): the front in int8 for the board's CPU
 
 # 2. The middle's calibration set, then its decoder and the generator's four stages
 python C/prep.py cut 200 npu
@@ -33,15 +35,19 @@ python C/stage.py parts/dec  ready/dec epsfix decpool decnorm
 python C/stage.py parts/g1   ready/g1  to4d sinfix poolfix epsfix snakeclamp
 python C/stage.py parts/g2   ready/g2  to4d sinfix poolfix epsfix snakeclamp
 python C/stage.py parts/g3   ready/g3  to4d len64 sinfix poolfix epsfix snakeclamp resmask
-python C/stage.py parts/g4   ready/g4  to4d len64 sinfix poolfix epsfix snakeclamp resmask
+python C/stage.py parts/g4   ready/g4  to4d len64 sinfix poolfix epsfix snakeclamp resmask fold
 
 # 4. Compile each stage (inside the ACUITY environment)
 for s in dec g1 g2 g3 g4; do C/build_stage.sh ready/$s; done
 
-# 5. The package for the board
-python C/package.py cut package dec=ready/dec g1=ready/g1 g2=ready/g2 g3=ready/g3 g4=ready/g4
-cp voices-v1.0.bin package/ && tar czf kokoro-a733-npu-model.tar.gz -C package .
+# 5. The package for the board, from the parent directory: every length's stages, the CPU parts of k200
+python C/package.py k200/cut package k200/ready k128/ready k80/ready
+tar czf kokoro-a733-npu-model.tar.gz -C package .
 ```
+
+`fold` (on g4 only) is optional: it makes g4 about 3 % faster. If the export of g4 never finishes with it, build g4
+without it. A package may hold any set of lengths (one is enough); the longest is the longest piece one NPU pass
+takes, and the runtime runs every piece at the shortest length it fits.
 
 Then on the board: `bash install.sh --package kokoro-a733-npu-model.tar.gz`.
 
@@ -55,7 +61,7 @@ the stage's `wksp/p_nbg_unify/network_binary.nb` and the inputs to the board and
 ```
 
 then compare `out.f32` with `ref_0.npy` (over the real samples only). The stages shipped in v1.1.0 reach, on
-sentences not used for calibration: dec 55 dB, g1 56, g2 48, g3 64, g4 42. Check a few sentences of different
+sentences not used for calibration: dec 55 dB, g1 56, g2 48, g3 64, g4 42 (at 200 frames). Check a few sentences of different
 lengths: a stage that gives the same poor SNR on every sentence has a broken operation (see the pitfalls, 7-9).
 
 The calibration set should look like what the board will speak: sentences of every length (short ones too), and

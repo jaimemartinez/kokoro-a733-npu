@@ -9,8 +9,8 @@
 # Options: --package <file.tar.gz> uses a model package already downloaded (offline install).
 set -euo pipefail
 
-VERSION=v1.1.1
-MODEL_VERSION=v1.1.0 # the compiled model package (a release asset); the code above comes from $VERSION
+VERSION=v1.2.0
+MODEL_VERSION=v1.2.0 # the compiled model package (a release asset); the code above comes from $VERSION
 REPO=jaimemartinez/kokoro-a733-npu
 PREFIX=/opt/kokoro-npu
 MODEL_URL=https://github.com/$REPO/releases/download/$MODEL_VERSION/kokoro-a733-npu-model-$MODEL_VERSION.tar.gz
@@ -82,8 +82,10 @@ cp "$SRC/kokoro_npu.py" $PREFIX/runtime/
 sed "1s|.*|#!$PREFIX/venv/bin/python|" "$SRC/kokoro-npu" > $PREFIX/bin/kokoro-npu && chmod +x $PREFIX/bin/kokoro-npu
 echo "OK."
 
-step "6/7 The voice model for the NPU (about 110 MB) and the voices (28 MB)"
+step "6/7 The voice model for the NPU (about 290 MB) and the voices (28 MB)"
 if [ -n "$PACKAGE" ]; then cp "$PACKAGE" "$TMP/model.tar.gz"; else fetch "$MODEL_URL" "$TMP/model.tar.gz"; fi
+# an older version's networks out of the way (the new package names them by length)
+rm -f $PREFIX/model/*.nb $PREFIX/model/manifest.json
 tar -xzf "$TMP/model.tar.gz" -C $PREFIX/model
 [ -f $PREFIX/model/voices-v1.0.bin ] || fetch "$VOICES_URL" $PREFIX/model/voices-v1.0.bin
 echo "OK."

@@ -14,13 +14,26 @@ Spanish, French, Italian, Portuguese, Hindi, Japanese and Chinese.
 |---|---|---|---|
 | Kokoro on the CPU (int8) | 80–160 s | 393 MB | 2.8–3.3 dB |
 | Kokoro on the NPU, v1.0.0 | 85 s | 271 MB | 3.5–4.2 dB |
-| **Kokoro on the NPU, v1.1.1** | **57–81 s** | **287 MB** | **0.6–0.7 dB** |
+| Kokoro on the NPU, v1.1.1 | 59–74 s | 283 MB | 0.6–3.5 dB (mean 1.6) |
+| **Kokoro on the NPU, v1.2.0** | **63–74 s** | **292 MB** | **0.5–1.0 dB (mean 0.8)** |
 
 *Board memory used*: how far the board's available memory fell during the run (the whole job: text, CPU parts,
-NPU), measured the same way for the three. Times vary with what else the board is doing; each row's range is from
-several runs. *Distance to the original model*: how far the audio is from the full-precision (float) Kokoro, as the
-average difference of the mel spectrum after aligning the two in time (lower is better; under ~1 dB is very hard to
-hear).
+NPU), measured the same way for all. Times vary with what else the board is doing (and how warm it is); each row's
+range is from several runs. *Distance to the original model*: how far the audio is from the full-precision (float)
+Kokoro, as the average difference of the mel spectrum after aligning the two in time (lower is better; under ~1 dB is
+very hard to hear), over every NPU pass of the greeting. The v1.1.1 and v1.2.0 rows were measured side by side on the
+same greeting; v1.1.1's passes in the middle of a long sentence come out up to 3.5 dB from the original (its release
+notes said 0.6–0.7 dB, measured on fewer passes), and v1.2.0's rebuilt networks bring them under 1 dB.
+
+v1.2.0 also speaks **short sentences faster**: the NPU networks are compiled at three lengths (about 5, 3.2 and 2 s of
+speech per pass) and each piece runs at the shortest one it fits, instead of always paying for a 5 s pass:
+
+| Radxa Cubie A7Z, voice `ef_dora`, measured side by side | v1.1.1 | v1.2.0 |
+|---|---|---|
+| "Hola, buenos días." (1.3 s of speech) | 5.7–5.8 s | 4.0–4.3 s |
+| Four sentences, short and long (12.5 s of speech) | 25.1–32.5 s | 19.8–21.5 s |
+
+A long greeting like the one above fills whole 5 s passes, so it takes as long as before.
 Since v1.1.0 the NPU is both **faster than the CPU** and **closer to the original voice than the CPU's int8 model**,
 and the CPU stays free for everything else the board is doing (calls, web servers, a home assistant...).
 
@@ -30,7 +43,7 @@ and the CPU stays free for everything else the board is doing (calls, web server
 
 - A board with the **Allwinner A733**: Radxa Cubie A7A or A7Z (tested on the A7Z with 1 GB of RAM).
 - The board maker's **official system image** (for Radxa: Radxa OS). It already includes the NPU driver.
-- **Internet** on the board during installation (about 450 MB is downloaded once).
+- **Internet** on the board during installation (about 650 MB is downloaded once).
 - **2 GB of free space** on the board.
 - A way to type commands on the board: a keyboard and screen, or SSH from your computer
   (`ssh radxa@<the board's IP>`).
@@ -135,8 +148,9 @@ NPU as five compiled networks (int16):
 text -> phonemes -> [front, CPU int8] -> [head, CPU] -> [dec -> g1 -> g2 -> g3 -> g4, NPU] -> [tail, CPU] -> audio
 ```
 
-Each NPU pass handles about 5 seconds of speech: consecutive sentences share one pass while they fit, and a shorter
-piece is padded and masked (same result). A longer sentence keeps its own intonation and timing: the CPU side runs on
+Each NPU pass handles up to about 5 seconds of speech: consecutive sentences share one pass while they fit. The
+networks are compiled at three lengths (200, 128 and 80 frames: about 5, 3.2 and 2 s), and each piece runs at the
+shortest one it fits, padded and masked (same result as at its own length; the NPU's time grows with the length). A longer sentence keeps its own intonation and timing: the CPU side runs on
 the whole sentence, and only the NPU part runs in overlapping windows that are crossfaded back together, so there is
 no pause or new intonation in the middle of it. The five networks run in one process (`npu_chain`), network by
 network: each one is loaded once per batch of four pieces, so only one is in memory at a time, and what the next one
@@ -160,7 +174,8 @@ differently on the chip than in the simulator.** If you convert your own models,
 - A convolution followed by an add on a sequence longer than 8191 is wrong after ~8022 samples: keep them apart.
 
 v1.1.0 fixed the last three in the model; the audio went from "sounds like the CPU" to measurably closer to the
-original than the CPU's int8 model.
+original than the CPU's int8 model. v1.2.0 calibrates on short sentences too, compiles the shorter lengths, and
+folds part of the last generator stage's elementwise work into fewer passes over memory (`fold`, g4 ~3 % faster).
 
 ## Rebuilding the model yourself (advanced)
 

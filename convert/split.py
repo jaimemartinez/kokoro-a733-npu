@@ -33,6 +33,17 @@ SENTENCES = [
     "La reunión es el sábado a las siete de la noche en el salón principal.",
     "¿Necesitas ayuda con algo en especial?",
     "Recuerda que puedes escribirnos en cualquier momento.",
+    # Short ones: the shorter compiled lengths (a pass of 2-3 s) are calibrated only on sentences that fit them.
+    "Hola, buenos días.",
+    "Gracias por llamar.",
+    "Un momento, por favor.",
+    "Con gusto te ayudamos.",
+    "Deja tu mensaje.",
+    "Hasta pronto.",
+    "Te llamaremos mañana.",
+    "¿Cómo estás?",
+    "Estamos para servirte.",
+    "Nadie puede contestar ahora.",
 ]
 VOICES = ["ef_dora", "em_alex", "em_santa"]
 runs = []

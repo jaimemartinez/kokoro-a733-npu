@@ -55,6 +55,10 @@ class NpuKokoro:
         self.pkg, self.runner, self.voices_path = pkg, runner, voices
         man = json.load(open(os.path.join(pkg, "manifest.json")))
         self.frames, self.stages = man["frames"], man["stages"]
+        # Shorter compiled lengths ("sets", same stages at fewer frames): a piece runs at the shortest one it fits, so
+        # a short sentence does not pay for a full pass of padding (the NPU's time grows with the length).
+        self.sets = sorted([(self.frames, self.stages)] + [(s["frames"], s["stages"]) for s in man.get("sets", [])],
+                           key=lambda fs: fs[0])
         fast = fast_cpus()
         if fast:
             try:
@@ -70,12 +74,15 @@ class NpuKokoro:
         # Every shape each named tensor is read at (the generator's last stages run on whole rows of 512, the first
         # ones at the audio's own length): one file per shape, since npu_run reads a file's first values and a row
         # padded for a longer stage would shift every later row of a shorter one.
-        self.shapes = {}
-        for s in self.stages:
-            for name, shape in s["inputs"]:
-                self.shapes.setdefault(name, [])
-                if list(shape) not in self.shapes[name]:
-                    self.shapes[name].append(list(shape))
+        self.set_shapes = {}
+        for fr, stages in self.sets:
+            shapes = self.set_shapes[fr] = {}
+            for s in stages:
+                for name, shape in s["inputs"]:
+                    shapes.setdefault(name, [])
+                    if list(shape) not in shapes[name]:
+                        shapes[name].append(list(shape))
+        self.shapes = self.set_shapes[self.frames]
 
     def _session(self, f):
         return ort.InferenceSession(os.path.join(self.pkg, f), sess_options=self.opts, providers=["CPUExecutionProvider"])
@@ -166,9 +173,14 @@ class NpuKokoro:
 
     def _speak(self, pieces, voices, speed, lang, work, progress):
         FR, steps = self.frames, len(self.stages) + 2
+        chain = os.path.join(os.path.dirname(self.runner), "npu_chain")
+        use_chain = all(s["engine"] == "npu" for _, st in self.sets for s in st) and os.path.exists(chain) \
+            and not os.environ.get("KOKORO_NPU_NO_CHAIN")
         path = lambda u, name: os.path.join(work, f"u{u}", name.strip("/").replace("/", "_") + ".f32")
+        unit_set = []  # the compiled length each unit runs at
         # A tensor read at more than one shape: the file for the shape a stage reads it at.
-        at = lambda u, name, shape: path(u, name) if len(self.shapes.get(name, [])) < 2 else path(u, f"{name}@{shape[-1]}")
+        at = lambda u, name, shape: path(u, name) if len(self.set_shapes[unit_set[u]].get(name, [])) < 2 \
+            else path(u, f"{name}@{shape[-1]}")
         self._load_front()
         head = self._session("head.onnx")
         units = []  # (voice, piece index, frames, pause, window)
@@ -179,6 +191,7 @@ class NpuKokoro:
                     u = len(units)
                     os.makedirs(os.path.join(work, f"u{u}"))
                     fr = asr.shape[-1]
+                    unit_set.append(next(f for f, _ in self.sets if f >= fr) if use_chain else FR)
                     if win is None:
                         har = head.run(None, {F0: f0})[0]
                     else:
@@ -194,15 +207,22 @@ class NpuKokoro:
                         # NPU loses a small constant added to small values).
                         t["epsn_" + k] = np.full((1, 1, 1), NORM_EPS * valid, np.float32)
                     for name, val in t.items():
-                        for shape in self.shapes.get(name, []):
+                        for shape in self.set_shapes[unit_set[u]].get(name, []):
                             fit(val, shape).tofile(at(u, name, shape))
                     units.append((v, pi, fr, pause, None if win is None else {k: win[k] for k in ("gid", "k", "of")}))
         del head
         self._release_front()
         progress(1, steps)
-        chain = os.path.join(os.path.dirname(self.runner), "npu_chain")
-        if all(s["engine"] == "npu" for s in self.stages) and os.path.exists(chain) and not os.environ.get("KOKORO_NPU_NO_CHAIN"):
-            self._chain(chain, units, work, path, at, lambda done: progress(1 + (steps - 2) * done / len(units), steps))
+        if use_chain:
+            finished = [0]
+
+            def done(n):
+                finished[0] += n
+                progress(1 + (steps - 2) * finished[0] / len(units), steps)
+            for fr, stages in self.sets:
+                ids = [u for u in range(len(units)) if unit_set[u] == fr]
+                if ids:
+                    self._chain(chain, stages, ids, work, path, at, done)
             progress(steps - 1, steps)
             return self._tail(pieces, voices, units, path, progress, steps)
         for si, s in enumerate(self.stages):
@@ -233,37 +253,35 @@ class NpuKokoro:
             progress(si + 2, steps)
         return self._tail(pieces, voices, units, path, progress, steps)
 
-    def _chain(self, chain, units, work, path, at, done=lambda d: None):
+    def _chain(self, chain, stages, ids, work, path, at, done=lambda n: None):
         """Every NPU stage of every unit through npu_chain: each network loaded once per batch, the tensors between them
         never written to files nor turned into floats; only the last one's output comes back. npu_chain keeps one
         network in memory at a time and a batch's tensors between networks in RAM: batches of CHAIN_BATCH units keep
         that bounded (a few MB per unit) whatever the length of the text."""
         made = {}
-        for k, s in enumerate(self.stages):
+        for k, s in enumerate(stages):
             for j, (n, _) in enumerate(s["outputs"]):
                 made.setdefault(n, (k, j))
-        per = 1 if os.environ.get("NPU_CHAIN_RESIDENT") else len(self.stages)  # progress lines per unit
-        finished = 0
-        for b0 in range(0, len(units), CHAIN_BATCH):
-            batch = range(b0, min(b0 + CHAIN_BATCH, len(units)))
-            jobs = os.path.join(work, f"chain{b0}.jobs")
+        per = 1 if os.environ.get("NPU_CHAIN_RESIDENT") else len(stages)  # progress lines per unit
+        for b0 in range(0, len(ids), CHAIN_BATCH):
+            batch = ids[b0:b0 + CHAIN_BATCH]
+            jobs = os.path.join(work, f"chain{batch[0]}.jobs")
             with open(jobs, "w") as f:
                 for u in batch:
                     groups = []
-                    for k, s in enumerate(self.stages):
+                    for k, s in enumerate(stages):
                         ins = ["@%d.%d" % made[n] if n in made and made[n][0] < k else at(u, n, sh) for n, sh in s["inputs"]]
                         outs = [path(u, n) if n == "post" else "-" for n, _ in s["outputs"]]
                         groups.append(" ".join(ins + ["--"] + outs))
                     f.write(" | ".join(groups) + "\n")
             # npu_chain prints a line per finished run ("step" per unit and network, "run" per unit when resident).
-            p = subprocess.Popen([chain] + [os.path.join(self.pkg, s["file"]) for s in self.stages] + ["@" + jobs],
+            p = subprocess.Popen([chain] + [os.path.join(self.pkg, s["file"]) for s in stages] + ["@" + jobs],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             lines = []
             for line in p.stderr:
                 lines.append(line.rstrip())
                 if line.startswith(("run ", "step ")):
-                    finished += 1
-                    done(finished / per)
+                    done(1 / per)
             if p.wait(timeout=900) != 0:
                 raise RuntimeError(f"npu chain: {lines[-1:]}")
 

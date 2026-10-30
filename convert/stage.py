@@ -4,9 +4,9 @@ the new model's inputs: rank-3 tensors get their unit axis, sequences are zero-p
 epsn_* inputs added by epsfix.py are computed from the matching inv_* (eps / inv).
 
   python stage.py <src dir> <dst dir> <rewrite> [<rewrite> ...]
-  rewrites: to4d len64 sinfix poolfix epsfix decpool decnorm snakeclamp resmask
+  rewrites: to4d len64 sinfix poolfix epsfix decpool decnorm snakeclamp resmask fold
   e.g. dec: epsfix decpool decnorm; g1/g2: to4d sinfix poolfix epsfix snakeclamp;
-       g3/g4: to4d len64 sinfix poolfix epsfix snakeclamp resmask"""
+       g3: to4d len64 sinfix poolfix epsfix snakeclamp resmask; g4: the same, then fold"""
 import os
 import shutil
 import subprocess
