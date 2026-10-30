@@ -6,19 +6,28 @@
 #
 # It installs into /opt/kokoro-npu and adds the `kokoro-npu` command. Nothing else on the system is changed except
 # one kernel setting (see below), the gcc compiler if missing, and the command in /usr/local/bin.
-# Options: --package <file.tar.gz> uses a model package already downloaded (offline install).
+# Options: --package <file.tar.gz> uses a model package already downloaded (offline install);
+#          --experimental-vocoder also installs the experimental fast vocoder (kokoro-npu --fast).
 set -euo pipefail
 
-VERSION=v1.2.0
+VERSION=v1.3.0
 MODEL_VERSION=v1.2.0 # the compiled model package (a release asset); the code above comes from $VERSION
 REPO=jaimemartinez/kokoro-a733-npu
 PREFIX=/opt/kokoro-npu
 MODEL_URL=https://github.com/$REPO/releases/download/$MODEL_VERSION/kokoro-a733-npu-model-$MODEL_VERSION.tar.gz
+VOCODER_URL=https://github.com/$REPO/releases/download/v1.3.0/kokoro-a733-npu-vocoder-v1.3.0.tar.gz
 VOICES_URL=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 ZOO_URL=https://dl.radxa.com/cubie/allwinner-model-zoo.tar.gz
 RAW=https://raw.githubusercontent.com/$REPO/$VERSION
 PACKAGE=""
-[ "${1:-}" = "--package" ] && PACKAGE=$(readlink -f "$2")
+VOCODER=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --package) PACKAGE=$(readlink -f "$2"); shift 2 ;;
+    --experimental-vocoder) VOCODER=1; shift ;;
+    *) echo "unknown option: $1"; exit 1 ;;
+  esac
+done
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 # A big download that survives a dropped connection: it resumes where it stopped, up to 8 times.
@@ -88,6 +97,12 @@ if [ -n "$PACKAGE" ]; then cp "$PACKAGE" "$TMP/model.tar.gz"; else fetch "$MODEL
 rm -f $PREFIX/model/*.nb $PREFIX/model/manifest.json
 tar -xzf "$TMP/model.tar.gz" -C $PREFIX/model
 [ -f $PREFIX/model/voices-v1.0.bin ] || fetch "$VOICES_URL" $PREFIX/model/voices-v1.0.bin
+rm -f $PREFIX/model/voc_scale.npy $PREFIX/model/vocoder.json
+if [ -n "$VOCODER" ]; then
+  echo "The experimental vocoder (about 15 MB; use it with kokoro-npu --fast)..."
+  fetch "$VOCODER_URL" "$TMP/vocoder.tar.gz"
+  tar -xzf "$TMP/vocoder.tar.gz" -C $PREFIX/model
+fi
 echo "OK."
 
 step "7/7 Last settings and a test"

@@ -34,6 +34,32 @@ speech per pass) and each piece runs at the shortest one it fits, instead of alw
 | Four sentences, short and long (12.5 s of speech) | 25.1–32.5 s | 19.8–21.5 s |
 
 A long greeting like the one above fills whole 5 s passes, so it takes as long as before.
+
+### Experimental: a much faster voice (`--fast`)
+
+v1.3.0 adds an optional, **experimental** vocoder: a small network trained to imitate the second half of Kokoro
+(its generator), which runs on the NPU in a fraction of the time. It is **2 to 5 times faster and uses less memory,
+but it still sounds somewhat robotic**: it is still training. Install it and try it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jaimemartinez/kokoro-a733-npu/main/install.sh | bash -s -- --experimental-vocoder
+kokoro-npu "Hola, ¿cómo estás?" --fast -o rapido.wav
+```
+
+Without `--fast` nothing changes. Measured on the A7Z, side by side:
+
+| | v1.3.0 (normal) | v1.3.0 `--fast` |
+|---|---|---|
+| "Hola, buenos días." (1.3 s of speech) | 2.7–2.8 s | 1.3 s |
+| Four sentences, short and long (12.5 s of speech) | 12.6–15.2 s | 2.8–3.8 s |
+| A long greeting, 3 voices (whole job, as above) | 60–68 s | 21–29 s |
+| Board memory used (peak), same greeting | 286–297 MB | 166–174 MB |
+| Distance to the float model, whole greeting | 3.9–4.0 dB | 4.2–4.3 dB |
+
+The distance here compares whole sentences with Kokoro run entirely in float on a PC (so it also counts the int8
+front's small differences in timing), unlike the per-pass figures above. By that measure `--fast` is only slightly
+further from the original, but the measure misses what the ear notices: its sound is less natural. How it is built
+and trained: [docs/vocoder.md](docs/vocoder.md).
 Since v1.1.0 the NPU is both **faster than the CPU** and **closer to the original voice than the CPU's int8 model**,
 and the CPU stays free for everything else the board is doing (calls, web servers, a home assistant...).
 
@@ -43,7 +69,7 @@ and the CPU stays free for everything else the board is doing (calls, web server
 
 - A board with the **Allwinner A733**: Radxa Cubie A7A or A7Z (tested on the A7Z with 1 GB of RAM).
 - The board maker's **official system image** (for Radxa: Radxa OS). It already includes the NPU driver.
-- **Internet** on the board during installation (about 650 MB is downloaded once).
+- **Internet** on the board during installation (about 650 MB is downloaded once; 17 MB more with the experimental vocoder).
 - **2 GB of free space** on the board.
 - A way to type commands on the board: a keyboard and screen, or SSH from your computer
   (`ssh radxa@<the board's IP>`).

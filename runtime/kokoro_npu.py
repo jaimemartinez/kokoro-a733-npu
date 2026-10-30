@@ -7,7 +7,12 @@ memory at a time; the tensors between stages wait on disk and each is deleted on
 does not grow with the text. The NPU networks have fixed lengths (manifest "frames", about 5 s of speech, and the
 shapes of their inputs): shorter pieces are zero-padded and masked (the result is the same as at their own length),
 longer ones are cut at a word boundary first. The NPU slows down when memory runs short (its driver then gets small
-pages), so the CPU models are released before the NPU stages run."""
+pages), so the CPU models are released before the NPU stages run.
+
+Experimental, off unless asked for (vocoder=True or KOKORO_NPU_VOCODER=1) and installed (vocoder.json in the package):
+a small vocoder distilled from Kokoro's generator. Only the decoder stage runs as above; its output, F0 and energy go
+through the vocoder on the NPU in fixed windows, and its spectrum becomes audio by an inverse STFT on the CPU: the
+head, the generator stages and tail are not used. 2 to 5 times faster on the A7Z; it still sounds somewhat robotic."""
 import gc
 import json
 import os
@@ -22,6 +27,8 @@ from kokoro_onnx.trim import trim as trim_audio
 
 ASR, F0, N = "/encoder/MatMul_1_output_0", "/encoder/Reshape_output_0", "/encoder/Reshape_1_output_0"
 POST = "/decoder/decoder/generator/conv_post/Conv_output_0"
+DEC, DEC_STYLE = "/decoder/decoder/decode.3/Div_4_output_0", "/decoder/Slice_output_0"  # the vocoder's inputs
+VOC_FFT, VOC_HOP = 1200, 300  # the vocoder's spectrum: one column per decoder frame (80 per second)
 WIN_OVERLAP = 8  # frames two windows of one long piece share (0.2 s), crossfaded
 HOP = 600  # audio samples per frame (24 kHz)
 CHAIN_BATCH = int(os.environ.get("KOKORO_NPU_BATCH", "4"))  # units per npu_chain run: bounds the RAM between networks
@@ -50,8 +57,36 @@ def fit(v, shape):
     return np.ascontiguousarray(v[..., :n]).reshape(shape)
 
 
+def voc_plan(n, T, ctx):
+    """[(start, first kept, end kept)]: the vocoder's windows of T frames over n frames, each keeping its middle
+    (ctx frames each side are only context). No window reaches past the end (zero frames are input the vocoder never
+    saw): the last one is aligned to the end, and a piece shorter than T is padded with its own last frame."""
+    if n <= T:
+        return [(0, 0, n)]
+    step = T - 2 * ctx
+    starts = sorted({min(k * step, n - T) for k in range(-(-(n - 2 * ctx) // step))} | {n - T})
+    return [(s, 0 if s == 0 else s + ctx, n if s == n - T else s + T - ctx) for s in starts]
+
+
+def istft(spec):
+    """The vocoder's output [log magnitude (601); phase (601)] x frames as audio (torch.istft, center=True)."""
+    mag = np.exp(np.minimum(spec[: VOC_FFT // 2 + 1], 7.0))
+    frames = np.fft.irfft(mag * np.exp(1j * spec[VOC_FFT // 2 + 1:]), VOC_FFT, axis=0).T  # [frames, VOC_FFT]
+    win = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(VOC_FFT) / VOC_FFT)).astype(np.float32)
+    k, t = VOC_FFT // VOC_HOP, frames.shape[0]
+    parts = (frames * win).reshape(t, k, VOC_HOP)
+    y = np.zeros((t + k - 1, VOC_HOP))
+    w = np.zeros((t + k - 1, VOC_HOP))
+    for j in range(k):
+        y[j:j + t] += parts[:, j]
+        w[j:j + t] += (win * win).reshape(k, VOC_HOP)[j]
+    y, w = y.ravel(), w.ravel()
+    y = np.where(w > 1e-11, y / np.maximum(w, 1e-11), 0.0)
+    return y[VOC_FFT // 2: VOC_FFT // 2 + t * VOC_HOP].astype(np.float32)
+
+
 class NpuKokoro:
-    def __init__(self, pkg, runner, voices, threads=2):
+    def __init__(self, pkg, runner, voices, threads=2, vocoder=None):
         self.pkg, self.runner, self.voices_path = pkg, runner, voices
         man = json.load(open(os.path.join(pkg, "manifest.json")))
         self.frames, self.stages = man["frames"], man["stages"]
@@ -59,6 +94,20 @@ class NpuKokoro:
         # a short sentence does not pay for a full pass of padding (the NPU's time grows with the length).
         self.sets = sorted([(self.frames, self.stages)] + [(s["frames"], s["stages"]) for s in man.get("sets", [])],
                            key=lambda fs: fs[0])
+        if vocoder is None:
+            vocoder = os.environ.get("KOKORO_NPU_VOCODER") == "1"
+        self.voc = None
+        if vocoder:
+            conf = os.path.join(pkg, "vocoder.json")
+            self.voc = man.get("vocoder") or (json.load(open(conf)) if os.path.exists(conf) else None)
+            if not self.voc:
+                raise RuntimeError("the experimental vocoder is not installed (install.sh --experimental-vocoder)")
+        if self.voc:
+            # the vocoder replaces everything after the decoder
+            keep = lambda st: [s for s in st if s["name"] == "dec"]
+            self.stages = keep(self.stages)
+            self.sets = [(fr, keep(st)) for fr, st in self.sets]
+            self.voc_scale = np.load(os.path.join(pkg, self.voc["scale"])).astype(np.float32)[:, None]
         fast = fast_cpus()
         if fast:
             try:
@@ -182,8 +231,9 @@ class NpuKokoro:
         at = lambda u, name, shape: path(u, name) if len(self.set_shapes[unit_set[u]].get(name, [])) < 2 \
             else path(u, f"{name}@{shape[-1]}")
         self._load_front()
-        head = self._session("head.onnx")
+        head = None if self.voc else self._session("head.onnx")
         units = []  # (voice, piece index, frames, pause, window)
+        prosody = []  # each unit's F0 and energy, for the vocoder
         whole = {}  # a long piece's harmonic source, for its windows
         for v in voices:
             for pi, text in self._packed(pieces, v, speed, lang):
@@ -192,7 +242,10 @@ class NpuKokoro:
                     os.makedirs(os.path.join(work, f"u{u}"))
                     fr = asr.shape[-1]
                     unit_set.append(next(f for f, _ in self.sets if f >= fr) if use_chain else FR)
-                    if win is None:
+                    if head is None:
+                        har = None
+                        prosody.append((f0.reshape(-1), n.reshape(-1)))
+                    elif win is None:
                         har = head.run(None, {F0: f0})[0]
                     else:
                         # the harmonic source of the WHOLE piece, cut: its phase runs on across the windows
@@ -207,12 +260,15 @@ class NpuKokoro:
                         # NPU loses a small constant added to small values).
                         t["epsn_" + k] = np.full((1, 1, 1), NORM_EPS * valid, np.float32)
                     for name, val in t.items():
-                        for shape in self.set_shapes[unit_set[u]].get(name, []):
+                        for shape in self.set_shapes[unit_set[u]].get(name, []) if val is not None else []:
                             fit(val, shape).tofile(at(u, name, shape))
                     units.append((v, pi, fr, pause, None if win is None else {k: win[k] for k in ("gid", "k", "of")}))
         del head
         self._release_front()
         progress(1, steps)
+        finish = (lambda: self._voc_tail(pieces, voices, units, prosody, unit_set, work, path, progress, steps)) \
+            if self.voc else (lambda: self._tail(pieces, voices, units, path, progress, steps))
+        keep = {DEC, DEC_STYLE} if self.voc else {"post"}
         if use_chain:
             finished = [0]
 
@@ -222,9 +278,9 @@ class NpuKokoro:
             for fr, stages in self.sets:
                 ids = [u for u in range(len(units)) if unit_set[u] == fr]
                 if ids:
-                    self._chain(chain, stages, ids, work, path, at, done)
+                    self._chain(chain, stages, ids, work, path, at, done, keep)
             progress(steps - 1, steps)
-            return self._tail(pieces, voices, units, path, progress, steps)
+            return finish()
         for si, s in enumerate(self.stages):
             if s["engine"] == "npu":
                 jobs = os.path.join(work, s["name"] + ".jobs")
@@ -242,7 +298,7 @@ class NpuKokoro:
                         np.ascontiguousarray(val, np.float32).tofile(path(u, n))
                 del sess
             # What no later stage reads is deleted now: its pages leave the cache, and memory stays free for the NPU.
-            later = {(n, sh[-1]) for t in self.stages[si + 1:] for n, sh in t["inputs"]} | {("post", None)}
+            later = {(n, sh[-1]) for t in self.stages[si + 1:] for n, sh in t["inputs"]} | {(k, None) for k in keep}
             for n, sh in s["inputs"]:
                 if (n, sh[-1]) not in later:
                     for u in range(len(units)):
@@ -251,13 +307,13 @@ class NpuKokoro:
                         except FileNotFoundError:
                             pass
             progress(si + 2, steps)
-        return self._tail(pieces, voices, units, path, progress, steps)
+        return finish()
 
-    def _chain(self, chain, stages, ids, work, path, at, done=lambda n: None):
+    def _chain(self, chain, stages, ids, work, path, at, done=lambda n: None, keep=("post",)):
         """Every NPU stage of every unit through npu_chain: each network loaded once per batch, the tensors between them
         never written to files nor turned into floats; only the last one's output comes back. npu_chain keeps one
         network in memory at a time and a batch's tensors between networks in RAM: batches of CHAIN_BATCH units keep
-        that bounded (a few MB per unit) whatever the length of the text."""
+        that bounded (a few MB per unit) whatever the length of the text. keep: the outputs written to files."""
         made = {}
         for k, s in enumerate(stages):
             for j, (n, _) in enumerate(s["outputs"]):
@@ -271,7 +327,7 @@ class NpuKokoro:
                     groups = []
                     for k, s in enumerate(stages):
                         ins = ["@%d.%d" % made[n] if n in made and made[n][0] < k else at(u, n, sh) for n, sh in s["inputs"]]
-                        outs = [path(u, n) if n == "post" else "-" for n, _ in s["outputs"]]
+                        outs = [path(u, n) if n in keep else "-" for n, _ in s["outputs"]]
                         groups.append(" ".join(ins + ["--"] + outs))
                     f.write(" | ".join(groups) + "\n")
             # npu_chain prints a line per finished run ("step" per unit and network, "run" per unit when resident).
@@ -287,11 +343,51 @@ class NpuKokoro:
 
     def _tail(self, pieces, voices, units, path, progress, steps):
         tail = self._session("tail.onnx")
+
+        def audio(u, fr):
+            post = np.fromfile(path(u, "post"), np.float32).reshape(1, 22, -1)[..., :120 * fr + 1]
+            return np.asarray(tail.run(None, {POST: np.ascontiguousarray(post)})[0], np.float32).ravel()
+        return self._join(pieces, voices, units, audio, progress, steps)
+
+    def _voc_tail(self, pieces, voices, units, prosody, unit_set, work, path, progress, steps):
+        """Every unit's decoder output through the vocoder: all their windows in one npu_run (the network loaded once),
+        then each unit's kept middles joined and turned into audio."""
+        T, ctx = self.voc["frames"], self.voc["context"]
+        plans, jobs = [], os.path.join(work, "voc.jobs")
+        with open(jobs, "w") as f:
+            for u, (_, _, fr, _, _) in enumerate(units):
+                n = 2 * fr  # decoder frames
+                dec = np.fromfile(path(u, DEC), np.float32).reshape(512, 2 * unit_set[u])[:, :n]
+                f0, en = prosody[u]
+                x = np.concatenate([dec, np.log1p(np.maximum(f0[:n], 0))[None] / 6, en[None, :n] / 10]) / self.voc_scale
+                if n < T:
+                    x = np.pad(x, ((0, 0), (0, T - n)), mode="edge")
+                style = path(u, DEC_STYLE)
+                plans.append(voc_plan(n, T, ctx))
+                for k, (s, _, _) in enumerate(plans[-1]):
+                    w = os.path.join(work, f"u{u}", f"voc{k}")
+                    np.ascontiguousarray(x[:, s:s + T], np.float32).tofile(w + ".in")
+                    f.write(f"{w}.in {style} -- {w}.out\n")
+                os.remove(path(u, DEC))
+        r = subprocess.run([self.runner, os.path.join(self.pkg, self.voc["file"]), "@" + jobs], capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            raise RuntimeError(f"npu vocoder: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
+
+        def audio(u, fr):
+            spec = np.zeros((VOC_FFT + 2, 2 * fr), np.float32)
+            for k, (s, lo, hi) in enumerate(plans[u]):
+                out = np.fromfile(os.path.join(work, f"u{u}", f"voc{k}.out"), np.float32).reshape(VOC_FFT + 2, T)
+                spec[:, lo:hi] = out[:, lo - s:hi - s]
+            return istft(spec)
+        return self._join(pieces, voices, units, audio, progress, steps)
+
+    def _join(self, pieces, voices, units, audio, progress, steps):
+        """Each unit's audio (audio(u, frames)) back into pieces: a long piece's windows crossfaded, silence trimmed,
+        the pause after it added."""
         out = {v: [[] for _ in pieces] for v in voices}
         pending = None  # the windows of a long piece so far, joined
         for u, (v, pi, fr, pause, win) in enumerate(units):
-            post = np.fromfile(path(u, "post"), np.float32).reshape(1, 22, -1)[..., :120 * fr + 1]
-            a = np.asarray(tail.run(None, {POST: np.ascontiguousarray(post)})[0], np.float32).ravel()
+            a = audio(u, fr)
             if win is not None:
                 if win["k"] == 0:
                     pending = a
